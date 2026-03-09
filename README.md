@@ -280,6 +280,55 @@ All probes work cross-platform with appropriate path handling for each OS.
 
 ---
 
+## Scrub Command
+
+> **Fork addition** -- not in upstream Bagel.
+
+`bagel scrub` removes credentials from AI CLI session logs and shell history files, replacing them with `[REDACTED-<type>]` markers while preserving conversation context.
+
+```bash
+# Scan and interactively confirm (default)
+bagel scrub
+
+# Skip prompt, apply immediately
+bagel scrub --yes
+
+# Scan only, no modifications
+bagel scrub --dry-run
+
+# Scrub without grace period (includes recent files)
+bagel scrub --yes --grace-minutes 0
+
+# Scrub a single file
+bagel scrub --yes --file ~/.claude/projects/foo/abc123.jsonl
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--yes` / `-y` | `false` | Skip confirmation prompt and apply changes |
+| `--dry-run` | `false` | Scan and report only, do not modify files |
+| `--grace-minutes` | `60` | Skip files modified within this many minutes |
+| `--file` | | Scrub a single file instead of all eligible files |
+
+**Targets:**
+- `~/.claude/projects/**/*.jsonl` -- Claude Code session logs
+- `~/.claude/projects/**/*.txt` -- Claude Code tool results
+- `~/.codex/sessions/**/*.jsonl` -- Codex CLI session logs
+- `~/.gemini/tmp/*/chats/*.json` -- Gemini CLI chat logs
+- `~/.local/share/opencode/**/*.json` -- OpenCode session logs
+- `~/.bash_history` -- Bash shell history
+- `~/.zsh_history` -- Zsh shell history
+- `~/.sh_history` -- Generic shell history
+- `~/.local/share/fish/fish_history` -- Fish shell history
+
+**Recommended workflow:**
+1. `bagel scan -f table` -- assess your exposure
+2. `bagel scrub --yes` -- clean up
+3. `bagel scan -f table` -- verify reduction
+4. Rotate any credentials that were found
+
+---
+
 ## Integrations
 
 * **CI**: run `bagel scan --strict` in your pipeline to fail builds when findings are detected.
