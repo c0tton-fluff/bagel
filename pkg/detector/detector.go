@@ -4,20 +4,11 @@
 package detector
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"regexp"
 	"strings"
 
 	"github.com/boostsecurityio/bagel/pkg/models"
 )
-
-// Fingerprint computes a SHA-256 hash of a secret for deduplication purposes.
-// This allows identifying the same secret across different locations without storing the actual value.
-func Fingerprint(secret string) string {
-	hash := sha256.Sum256([]byte(secret))
-	return hex.EncodeToString(hash[:])
-}
 
 // Detector defines the interface for secret/credential detectors
 type Detector interface {
@@ -45,7 +36,8 @@ type RedactPattern struct {
 
 // Registry manages all registered detectors
 type Registry struct {
-	detectors []Detector
+	detectors       []Detector
+	fingerprintSalt string
 }
 
 // NewRegistry creates a new detector registry
@@ -53,6 +45,11 @@ func NewRegistry() *Registry {
 	return &Registry{
 		detectors: []Detector{},
 	}
+}
+
+// SetFingerprintSalt sets the machine-specific salt used for secret fingerprinting.
+func (r *Registry) SetFingerprintSalt(salt string) {
+	r.fingerprintSalt = salt
 }
 
 // Register adds a detector to the registry
@@ -63,6 +60,9 @@ func (r *Registry) Register(d Detector) {
 // DetectAll runs all registered detectors against the content
 // The context parameter provides probe-specific metadata that gets included in findings
 func (r *Registry) DetectAll(content string, ctx *models.DetectionContext) []models.Finding {
+	// Propagate the registry's fingerprint salt to the detection context
+	ctx.FingerprintSalt = r.fingerprintSalt
+
 	findings := make([]models.Finding, 0, len(r.detectors))
 
 	for _, det := range r.detectors {
