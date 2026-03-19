@@ -15,7 +15,6 @@ import (
 	"time"
 
 	"github.com/rs/zerolog/log"
-	"golang.org/x/sync/errgroup"
 )
 
 // FileIndex holds the results of the file system scan
@@ -98,12 +97,6 @@ type Pattern struct {
 	Type     PatternType // Type of pattern matching
 }
 
-// fileEntry represents a discovered file to be processed by workers
-type fileEntry struct {
-	baseDir  string
-	filePath string
-}
-
 // BuildIndexInput holds the input parameters for building a file index
 type BuildIndexInput struct {
 	BaseDirs         []string              // Base directories to search (e.g., ["$HOME"])
@@ -113,7 +106,7 @@ type BuildIndexInput struct {
 	ProgressCallback func(processed int64) // Optional progress reporter
 }
 
-// BuildIndex recursively scans directories and builds a file index using concurrent workers
+// BuildIndex recursively scans directories and builds a file index with inline matching
 func BuildIndex(ctx context.Context, input BuildIndexInput) (*FileIndex, error) {
 	index := NewFileIndex()
 
@@ -124,17 +117,12 @@ func BuildIndex(ctx context.Context, input BuildIndexInput) (*FileIndex, error) 
 		expandedDirs = append(expandedDirs, expanded)
 	}
 
-	numWorkers := runtime.NumCPU()
 	log.Ctx(ctx).Info().
 		Strs("base_dirs", expandedDirs).
 		Int("pattern_count", len(input.Patterns)).
 		Int("max_depth", input.MaxDepth).
 		Bool("follow_symlinks", input.FollowSymlinks).
-		Int("num_workers", numWorkers).
 		Msg("Building file index")
-
-	// Channel for discovered files
-	filesChan := make(chan fileEntry, numWorkers*100)
 
 	// Counter for progress reporting
 	var filesProcessed atomic.Int64
@@ -160,38 +148,22 @@ func BuildIndex(ctx context.Context, input BuildIndexInput) (*FileIndex, error) 
 		}
 	}()
 
-	// Use errgroup for coordinated cancellation
-	g, gctx := errgroup.WithContext(ctx)
-
-	// Start workers
-	for i := 0; i < numWorkers; i++ {
-		g.Go(func() error {
-			runWorker(gctx, filesChan, input.Patterns, index, &filesProcessed)
-			return nil
-		})
-	}
-
-	// Start discovery goroutines - one per base directory
-	discoveryGroup, discoveryCtx := errgroup.WithContext(gctx)
+	// Discovery — one goroutine per base dir, each runs parallel walkers internally
+	var discoveryWg sync.WaitGroup
 	for _, baseDir := range expandedDirs {
-		discoveryGroup.Go(func() error {
-			return runDiscovery(discoveryCtx, baseDir, input, filesChan)
-		})
+		discoveryWg.Add(1)
+		go func(dir string) {
+			defer discoveryWg.Done()
+			runDiscovery(ctx, dir, input, index, &filesProcessed)
+		}(baseDir)
 	}
 
-	// Wait for all discovery to complete, then close channel
-	go func() {
-		_ = discoveryGroup.Wait()
-		close(filesChan)
-	}()
-
-	// Wait for workers to finish
-	if err := g.Wait(); err != nil {
-		close(progressDone)
-		return nil, fmt.Errorf("file index build failed: %w", err)
-	}
-
+	discoveryWg.Wait()
 	close(progressDone)
+
+	if err := ctx.Err(); err != nil {
+		return index, fmt.Errorf("build file index: %w", err)
+	}
 
 	totalFiles := index.TotalFiles()
 	log.Ctx(ctx).Info().
@@ -202,8 +174,14 @@ func BuildIndex(ctx context.Context, input BuildIndexInput) (*FileIndex, error) 
 	return index, nil
 }
 
-// runDiscovery validates a base directory and starts file discovery
-func runDiscovery(ctx context.Context, baseDir string, input BuildIndexInput, filesChan chan<- fileEntry) error {
+// runDiscovery validates a base directory and starts file discovery with inline matching
+func runDiscovery(
+	ctx context.Context,
+	baseDir string,
+	input BuildIndexInput,
+	index *FileIndex,
+	filesProcessed *atomic.Int64,
+) {
 	// Check if base directory exists and is accessible
 	info, err := os.Stat(baseDir)
 	if err != nil {
@@ -211,53 +189,49 @@ func runDiscovery(ctx context.Context, baseDir string, input BuildIndexInput, fi
 			Err(err).
 			Str("base_dir", baseDir).
 			Msg("Skipping inaccessible base directory")
-		return nil
+		return
 	}
 
 	if !info.IsDir() {
 		log.Ctx(ctx).Warn().
 			Str("base_dir", baseDir).
 			Msg("Skipping non-directory base path")
-		return nil
+		return
 	}
 
-	return walkDirectory(ctx, baseDir, baseDir, input, filesChan, 0)
+	// Create semaphore and WaitGroup for parallel subdirectory traversal (GDU-style)
+	sem := make(chan struct{}, 3*runtime.GOMAXPROCS(0))
+	var wg sync.WaitGroup
+
+	walkDirectory(ctx, baseDir, baseDir, input, input.Patterns, index, filesProcessed, 0, sem, &wg)
+
+	// Wait for all spawned goroutines to finish before returning
+	wg.Wait()
 }
 
-// runWorker processes files from the channel and matches them against patterns
-func runWorker(ctx context.Context, filesChan <-chan fileEntry, patterns []Pattern, index *FileIndex, filesProcessed *atomic.Int64) {
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case entry, ok := <-filesChan:
-			if !ok {
-				return
-			}
-			matchFile(ctx, entry.baseDir, entry.filePath, patterns, index)
-			filesProcessed.Add(1)
-		}
-	}
-}
-
-// walkDirectory recursively walks a directory and sends discovered files to the channel
+// walkDirectory recursively walks a directory and matches discovered files inline.
+// Subdirectories are traversed in parallel using goroutines gated by the semaphore (GDU-style).
 func walkDirectory(
 	ctx context.Context,
 	baseDir string,
 	currentDir string,
 	input BuildIndexInput,
-	filesChan chan<- fileEntry,
+	patterns []Pattern,
+	index *FileIndex,
+	filesProcessed *atomic.Int64,
 	depth int,
-) error {
+	sem chan struct{},
+	wg *sync.WaitGroup,
+) {
 	// Check depth limit
 	if input.MaxDepth > 0 && depth > input.MaxDepth {
-		return nil
+		return
 	}
 
 	// Check if context is cancelled
 	select {
 	case <-ctx.Done():
-		return fmt.Errorf("context cancelled: %w", ctx.Err())
+		return
 	default:
 	}
 
@@ -269,10 +243,17 @@ func walkDirectory(
 			Err(err).
 			Str("dir", currentDir).
 			Msg("Cannot read directory")
-		return nil
+		return
 	}
 
 	for _, entry := range entries {
+		// Check cancellation each iteration for responsive shutdown
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
 		fullPath := filepath.Join(currentDir, entry.Name())
 
 		// Handle symbolic links
@@ -298,38 +279,51 @@ func walkDirectory(
 			}
 
 			if resolvedInfo.IsDir() {
-				// Recursively walk symlinked directory
-				if err := walkDirectory(ctx, baseDir, resolvedPath, input, filesChan, depth+1); err != nil {
-					return err
+				select {
+				case sem <- struct{}{}:
+					wg.Add(1)
+					go func(path string) {
+						defer wg.Done()
+						defer func() { <-sem }()
+						walkDirectory(ctx, baseDir, path, input, patterns, index, filesProcessed, depth+1, sem, wg)
+					}(resolvedPath)
+				case <-ctx.Done():
+					return
+				default:
+					// Semaphore full - recurse inline to avoid deadlock
+					walkDirectory(ctx, baseDir, resolvedPath, input, patterns, index, filesProcessed, depth+1, sem, wg)
 				}
 			} else {
-				// Send symlinked file to channel
-				select {
-				case <-ctx.Done():
-					return fmt.Errorf("context cancelled: %w", ctx.Err())
-				case filesChan <- fileEntry{baseDir: baseDir, filePath: resolvedPath}:
-				}
+				// Match symlinked file inline
+				matchFile(ctx, baseDir, resolvedPath, patterns, index)
+				filesProcessed.Add(1)
 			}
 			continue
 		}
 
 		// Handle directories
 		if entry.IsDir() {
-			if err := walkDirectory(ctx, baseDir, fullPath, input, filesChan, depth+1); err != nil {
-				return err
+			select {
+			case sem <- struct{}{}:
+				wg.Add(1)
+				go func(path string) {
+					defer wg.Done()
+					defer func() { <-sem }()
+					walkDirectory(ctx, baseDir, path, input, patterns, index, filesProcessed, depth+1, sem, wg)
+				}(fullPath)
+			case <-ctx.Done():
+				return
+			default:
+				// Semaphore full - recurse inline to avoid deadlock
+				walkDirectory(ctx, baseDir, fullPath, input, patterns, index, filesProcessed, depth+1, sem, wg)
 			}
 			continue
 		}
 
-		// Send file to channel
-		select {
-		case <-ctx.Done():
-			return fmt.Errorf("context cancelled: %w", ctx.Err())
-		case filesChan <- fileEntry{baseDir: baseDir, filePath: fullPath}:
-		}
+		// Match file inline
+		matchFile(ctx, baseDir, fullPath, patterns, index)
+		filesProcessed.Add(1)
 	}
-
-	return nil
 }
 
 // expandHomeDir expands $HOME, %USERPROFILE%, and ~ to the user's home directory.
